@@ -9,9 +9,18 @@ use std::slice;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime as DateTime;
 
+use electrs_macros::trace;
+
 const MTP_SPAN: usize = 11;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+lazy_static! {
+    pub static ref DEFAULT_BLOCKHASH: BlockHash =
+        "0000000000000000000000000000000000000000000000000000000000000000"
+            .parse()
+            .unwrap();
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct BlockId {
     pub height: usize,
     pub hash: BlockHash,
@@ -36,6 +45,14 @@ pub struct HeaderEntry {
 }
 
 impl HeaderEntry {
+    #[cfg(feature = "bench")]
+    pub fn new(height: usize, hash: BlockHash, header: BlockHeader) -> Self {
+        Self {
+            height,
+            hash,
+            header,
+        }
+    }
     pub fn hash(&self) -> &BlockHash {
         &self.hash
     }
@@ -73,10 +90,11 @@ impl HeaderList {
         HeaderList {
             headers: vec![],
             heights: HashMap::new(),
-            tip: BlockHash::default(),
+            tip: *DEFAULT_BLOCKHASH,
         }
     }
 
+    #[trace]
     pub fn new(
         mut headers_map: HashMap<BlockHash, BlockHeader>,
         tip_hash: BlockHash,
@@ -89,9 +107,8 @@ impl HeaderList {
 
         let mut blockhash = tip_hash;
         let mut headers_chain: Vec<BlockHeader> = vec![];
-        let null_hash = BlockHash::default();
 
-        while blockhash != null_hash {
+        while blockhash != *DEFAULT_BLOCKHASH {
             let header = headers_map.remove(&blockhash).unwrap_or_else(|| {
                 panic!(
                     "missing expected blockhash in headers map: {:?}, pointed from: {:?}",
@@ -115,6 +132,7 @@ impl HeaderList {
         headers
     }
 
+    #[trace]
     pub fn order(&self, new_headers: Vec<BlockHeader>) -> Vec<HeaderEntry> {
         // header[i] -> header[i-1] (i.e. header.last() is the tip)
         struct HashedHeader {
@@ -136,8 +154,7 @@ impl HeaderList {
             Some(h) => h.header.prev_blockhash,
             None => return vec![], // hashed_headers is empty
         };
-        let null_hash = BlockHash::default();
-        let new_height: usize = if prev_blockhash == null_hash {
+        let new_height: usize = if prev_blockhash == *DEFAULT_BLOCKHASH {
             0
         } else {
             self.header_by_blockhash(&prev_blockhash)
@@ -155,6 +172,7 @@ impl HeaderList {
             .collect()
     }
 
+    #[trace]
     pub fn apply(&mut self, new_headers: Vec<HeaderEntry>) {
         // new_headers[i] -> new_headers[i - 1] (i.e. new_headers.last() is the tip)
         for i in 1..new_headers.len() {
@@ -170,7 +188,7 @@ impl HeaderList {
                 let expected_prev_blockhash = if height > 0 {
                     *self.headers[height - 1].hash()
                 } else {
-                    BlockHash::default()
+                    *DEFAULT_BLOCKHASH
                 };
                 assert_eq!(entry.header().prev_blockhash, expected_prev_blockhash);
                 height
@@ -192,6 +210,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn header_by_blockhash(&self, blockhash: &BlockHash) -> Option<&HeaderEntry> {
         let height = self.heights.get(blockhash)?;
         let header = self.headers.get(*height)?;
@@ -202,6 +221,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn header_by_height(&self, height: usize) -> Option<&HeaderEntry> {
         self.headers.get(height).map(|entry| {
             assert_eq!(entry.height(), height);
@@ -216,7 +236,10 @@ impl HeaderList {
     pub fn tip(&self) -> &BlockHash {
         assert_eq!(
             self.tip,
-            self.headers.last().map(|h| *h.hash()).unwrap_or_default()
+            self.headers
+                .last()
+                .map(|h| *h.hash())
+                .unwrap_or(*DEFAULT_BLOCKHASH)
         );
         &self.tip
     }
@@ -292,9 +315,16 @@ pub struct BlockHeaderMeta {
 
 impl From<&BlockEntry> for BlockMeta {
     fn from(b: &BlockEntry) -> BlockMeta {
+        let weight = b.block.weight();
+        #[cfg(not(feature = "liquid"))] // rust-bitcoin has a wrapper Weight type
+        let weight = weight.to_wu();
+
         BlockMeta {
             tx_count: b.block.txdata.len() as u32,
-            weight: b.block.weight() as u32,
+            // To retain DB compatibility, block weights are converted from the u64
+            // representation used as of rust-bitcoin v0.30 back to a u32. This is OK
+            // because u32::MAX is far above MAX_BLOCK_WEIGHT.
+            weight: weight as u32,
             size: b.size,
         }
     }

@@ -1,27 +1,28 @@
 use arraydeque::{ArrayDeque, Wrapping};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::serialize;
+use electrs_macros::trace;
 #[cfg(feature = "liquid")]
 use elements::{encode::serialize, AssetId};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter::FromIterator;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{deserialize, BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{GaugeVec, HistogramOpts, HistogramVec, MetricOpts, Metrics};
 use crate::new_index::{
-    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, ScriptStats, SpendingInfo,
-    SpendingInput, TxHistoryInfo, Utxo,
+    compute_script_hash, schema::FullHash, ChainQuery, FundingInfo, GetAmountVal, ScriptStats,
+    SpendingInfo, SpendingInput, TxHistoryInfo, Utxo,
 };
 use crate::util::fees::{make_fee_histogram, TxFeeInfo};
-use crate::util::{extract_tx_prevouts, full_hash, has_prevout, is_spendable, Bytes};
+use crate::util::{extract_tx_prevouts, full_hash, get_prev_outpoints, is_spendable, Bytes};
 
 #[cfg(feature = "liquid")]
 use crate::elements::asset;
@@ -36,7 +37,7 @@ pub struct Mempool {
     feeinfo: HashMap<Txid, TxFeeInfo>,
     history: HashMap<FullHash, Vec<TxHistoryInfo>>, // ScriptHash -> {history_entries}
     edges: HashMap<OutPoint, (Txid, u32)>,          // OutPoint -> (spending_txid, spending_vin)
-    recent: ArrayDeque<[TxOverview; RECENT_TXS_SIZE], Wrapping>, // The N most recent txs to enter the mempool
+    recent: ArrayDeque<TxOverview, RECENT_TXS_SIZE, Wrapping>, // The N most recent txs to enter the mempool
     backlog_stats: (BacklogStats, Instant),
 
     // monitoring
@@ -56,9 +57,11 @@ pub struct Mempool {
 pub struct TxOverview {
     txid: Txid,
     fee: u64,
-    vsize: u32,
+    vsize: u64,
     #[cfg(not(feature = "liquid"))]
     value: u64,
+    #[cfg(feature = "liquid")]
+    discount_vsize: u64,
 }
 
 impl Mempool {
@@ -107,6 +110,7 @@ impl Mempool {
         self.txstore.get(txid).map(serialize)
     }
 
+    #[trace]
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
         self.edges.get(outpoint).map(|(txid, vin)| SpendingInput {
             txid: *txid,
@@ -123,6 +127,7 @@ impl Mempool {
         Some(self.feeinfo.get(txid)?.fee)
     }
 
+    #[trace]
     pub fn has_unconfirmed_parents(&self, txid: &Txid) -> bool {
         let tx = match self.txstore.get(txid) {
             Some(tx) => tx,
@@ -133,6 +138,7 @@ impl Mempool {
             .any(|txin| self.txstore.contains_key(&txin.previous_output.txid))
     }
 
+    #[trace]
     pub fn history(&self, scripthash: &[u8], limit: usize) -> Vec<Transaction> {
         let _timer = self.latency.with_label_values(&["history"]).start_timer();
         self.history
@@ -140,6 +146,7 @@ impl Mempool {
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
 
+    #[trace]
     fn _history(&self, entries: &[TxHistoryInfo], limit: usize) -> Vec<Transaction> {
         entries
             .iter()
@@ -151,6 +158,7 @@ impl Mempool {
             .collect()
     }
 
+    #[trace]
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<Txid> {
         let _timer = self
             .latency
@@ -167,6 +175,7 @@ impl Mempool {
         }
     }
 
+    #[trace]
     pub fn utxo(&self, scripthash: &[u8]) -> Vec<Utxo> {
         let _timer = self.latency.with_label_values(&["utxo"]).start_timer();
         let entries = match self.history.get(scripthash) {
@@ -209,6 +218,7 @@ impl Mempool {
             .collect()
     }
 
+    #[trace]
     // @XXX avoid code duplication with ChainQuery::stats()?
     pub fn stats(&self, scripthash: &[u8]) -> ScriptStats {
         let _timer = self.latency.with_label_values(&["stats"]).start_timer();
@@ -258,12 +268,14 @@ impl Mempool {
         stats
     }
 
+    #[trace]
     // Get all txids in the mempool
     pub fn txids(&self) -> Vec<&Txid> {
         let _timer = self.latency.with_label_values(&["txids"]).start_timer();
         self.txstore.keys().collect()
     }
 
+    #[trace]
     // Get an overview of the most recent transactions
     pub fn recent_txs_overview(&self) -> Vec<&TxOverview> {
         // We don't bother ever deleting elements from the recent list.
@@ -272,82 +284,76 @@ impl Mempool {
         self.recent.iter().collect()
     }
 
+    #[trace]
     pub fn backlog_stats(&self) -> &BacklogStats {
         &self.backlog_stats.0
     }
 
-    pub fn update(&mut self, daemon: &Daemon) -> Result<()> {
-        let _timer = self.latency.with_label_values(&["update"]).start_timer();
-        let new_txids = daemon
-            .getmempooltxids()
-            .chain_err(|| "failed to update mempool from daemon")?;
-        let old_txids = HashSet::from_iter(self.txstore.keys().cloned());
-        let to_remove: HashSet<&Txid> = old_txids.difference(&new_txids).collect();
-
-        // Download and add new transactions from bitcoind's mempool
-        let txids: Vec<&Txid> = new_txids.difference(&old_txids).collect();
-        let to_add = match daemon.gettransactions(&txids) {
-            Ok(txs) => txs,
-            Err(err) => {
-                warn!("failed to get {} transactions: {}", txids.len(), err); // e.g. new block or RBF
-                return Ok(()); // keep the mempool until next update()
-            }
-        };
-        // Add new transactions
-        self.add(to_add);
-        // Remove missing transactions
-        self.remove(to_remove);
-
-        self.count
-            .with_label_values(&["txs"])
-            .set(self.txstore.len() as f64);
-
-        // Update cached backlog stats (if expired)
-        if self.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
-            let _timer = self
-                .latency
-                .with_label_values(&["update_backlog_stats"])
-                .start_timer();
-            self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
-        }
-
-        Ok(())
+    #[trace]
+    pub fn txids_set(&self) -> HashSet<Txid> {
+        return HashSet::from_iter(self.txstore.keys().cloned());
     }
 
-    pub fn add_by_txid(&mut self, daemon: &Daemon, txid: &Txid) {
-        if self.txstore.get(txid).is_none() {
+    #[trace]
+    pub fn update_backlog_stats(&mut self) {
+        let _timer = self
+            .latency
+            .with_label_values(&["update_backlog_stats"])
+            .start_timer();
+        self.backlog_stats = (BacklogStats::new(&self.feeinfo), Instant::now());
+    }
+
+    #[trace]
+    pub fn add_by_txid(&mut self, daemon: &Daemon, txid: Txid) -> Result<()> {
+        if self.txstore.get(&txid).is_none() {
             if let Ok(tx) = daemon.getmempooltx(&txid) {
-                self.add(vec![tx])
+                let mut txs_map = HashMap::new();
+                txs_map.insert(txid, tx);
+                self.add(txs_map)
+            } else {
+                bail!("add_by_txid cannot find {}", txid);
             }
+        } else {
+            Ok(())
         }
     }
 
-    fn add(&mut self, txs: Vec<Transaction>) {
+    #[trace]
+    fn add(&mut self, txs_map: HashMap<Txid, Transaction>) -> Result<()> {
         self.delta
             .with_label_values(&["add"])
-            .observe(txs.len() as f64);
+            .observe(txs_map.len() as f64);
         let _timer = self.latency.with_label_values(&["add"]).start_timer();
 
-        let mut txids = vec![];
-        // Phase 1: add to txstore
-        for tx in txs {
-            let txid = tx.txid();
-            txids.push(txid);
+        let spent_prevouts = get_prev_outpoints(txs_map.values());
+
+        // Lookup spent prevouts that were funded within the same `add` batch
+        let mut txos = HashMap::new();
+        let remain_prevouts = spent_prevouts
+            .into_iter()
+            .filter(|prevout| {
+                if let Some(prevtx) = txs_map.get(&prevout.txid) {
+                    if let Some(out) = prevtx.output.get(prevout.vout as usize) {
+                        txos.insert(prevout.clone(), out.clone());
+                        // remove from the list of remaining `prevouts`
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        // Lookup remaining spent prevouts in mempool & on-chain
+        // Fails if any are missing.
+        txos.extend(self.lookup_txos(remain_prevouts)?);
+
+        // Add to txstore and indexes
+        for (txid, tx) in txs_map {
             self.txstore.insert(txid, tx);
-        }
-        // Phase 2: index history and spend edges (can fail if some txos cannot be found)
-        let txos = match self.lookup_txos(&self.get_prevouts(&txids)) {
-            Ok(txos) => txos,
-            Err(err) => {
-                warn!("lookup txouts failed: {}", err);
-                // TODO: should we remove txids from txstore?
-                return;
-            }
-        };
-        for txid in txids {
-            let tx = self.txstore.get(&txid).expect("missing mempool tx");
-            let txid_bytes = full_hash(&txid[..]);
+            let tx = self.txstore.get(&txid).expect("was just added");
+
             let prevouts = extract_tx_prevouts(&tx, &txos, false);
+            let txid_bytes = full_hash(&txid[..]);
 
             // Get feeinfo for caching and recent tx overview
             let feeinfo = TxFeeInfo::new(&tx, &prevouts, self.config.network_type);
@@ -358,7 +364,12 @@ impl Mempool {
                 fee: feeinfo.fee,
                 vsize: feeinfo.vsize,
                 #[cfg(not(feature = "liquid"))]
-                value: prevouts.values().map(|prevout| prevout.value).sum(),
+                value: prevouts
+                    .values()
+                    .map(|prevout| prevout.value.to_sat())
+                    .sum(),
+                #[cfg(feature = "liquid")]
+                discount_vsize: tx.discount_vsize() as u64,
             });
 
             self.feeinfo.insert(txid, feeinfo);
@@ -373,7 +384,7 @@ impl Mempool {
                         vin: input_index as u16,
                         prev_txid: full_hash(&txi.previous_output.txid[..]),
                         prev_vout: txi.previous_output.vout as u16,
-                        value: prevout.value,
+                        value: prevout.value.amount_value(),
                     }),
                 )
             });
@@ -392,7 +403,7 @@ impl Mempool {
                         TxHistoryInfo::Funding(FundingInfo {
                             txid: txid_bytes,
                             vout: index as u16,
-                            value: txo.value,
+                            value: txo.value.amount_value(),
                         }),
                     )
                 });
@@ -418,57 +429,39 @@ impl Mempool {
                 &mut self.asset_issuance,
             );
         }
+
+        Ok(())
     }
 
-    pub fn lookup_txo(&self, outpoint: &OutPoint) -> Result<TxOut> {
-        let mut outpoints = BTreeSet::new();
-        outpoints.insert(*outpoint);
-        Ok(self.lookup_txos(&outpoints)?.remove(outpoint).unwrap())
+    fn lookup_txo(&self, outpoint: &OutPoint) -> Option<TxOut> {
+        self.txstore
+            .get(&outpoint.txid)
+            .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
     }
 
-    pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    #[trace]
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self
             .latency
             .with_label_values(&["lookup_txos"])
             .start_timer();
 
-        let confirmed_txos = self.chain.lookup_avail_txos(outpoints);
+        // Get the txos available in the mempool, skipping over (and collecting) missing ones
+        let (mut txos, remain_outpoints): (HashMap<_, _>, _) =
+            outpoints
+                .into_iter()
+                .partition_map(|outpoint| match self.lookup_txo(&outpoint) {
+                    Some(txout) => Either::Left((outpoint, txout)),
+                    None => Either::Right(outpoint),
+                });
 
-        let mempool_txos = outpoints
-            .iter()
-            .filter(|outpoint| !confirmed_txos.contains_key(outpoint))
-            .map(|outpoint| {
-                self.txstore
-                    .get(&outpoint.txid)
-                    .and_then(|tx| tx.output.get(outpoint.vout as usize).cloned())
-                    .map(|txout| (*outpoint, txout))
-                    .chain_err(|| format!("missing outpoint {:?}", outpoint))
-            })
-            .collect::<Result<HashMap<OutPoint, TxOut>>>()?;
+        // Get the remaining txos from the chain (fails if any are missing)
+        txos.extend(self.chain.lookup_txos(remain_outpoints)?);
 
-        let mut txos = confirmed_txos;
-        txos.extend(mempool_txos);
         Ok(txos)
     }
 
-    fn get_prevouts(&self, txids: &[Txid]) -> BTreeSet<OutPoint> {
-        let _timer = self
-            .latency
-            .with_label_values(&["get_prevouts"])
-            .start_timer();
-
-        txids
-            .iter()
-            .map(|txid| self.txstore.get(txid).expect("missing mempool tx"))
-            .flat_map(|tx| {
-                tx.input
-                    .iter()
-                    .filter(|txin| has_prevout(txin))
-                    .map(|txin| txin.previous_output)
-            })
-            .collect()
-    }
-
+    #[trace]
     fn remove(&mut self, to_remove: HashSet<&Txid>) {
         self.delta
             .with_label_values(&["remove"])
@@ -504,6 +497,7 @@ impl Mempool {
     }
 
     #[cfg(feature = "liquid")]
+    #[trace]
     pub fn asset_history(&self, asset_id: &AssetId, limit: usize) -> Vec<Transaction> {
         let _timer = self
             .latency
@@ -513,14 +507,123 @@ impl Mempool {
             .get(asset_id)
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
+
+    /// Sync our local view of the mempool with the bitcoind Daemon RPC. If the chain tip moves before
+    /// the mempool is fetched in full, syncing is aborted and an Ok(false) is returned.
+    #[trace]
+    pub fn update(
+        mempool: &Arc<RwLock<Mempool>>,
+        daemon: &Daemon,
+        tip: &BlockHash,
+    ) -> Result<bool> {
+        let _timer = mempool
+            .read()
+            .unwrap()
+            .latency
+            .with_label_values(&["update"])
+            .start_timer();
+
+        // Continuously attempt to fetch mempool transactions until we're able to get them in full
+        let mut fetched_txs = HashMap::<Txid, Transaction>::new();
+        let mut indexed_txids = mempool.read().unwrap().txids_set();
+        loop {
+            // Get bitcoind's current list of mempool txids
+            let all_txids = daemon
+                .getmempooltxids()
+                .chain_err(|| "failed to update mempool from daemon")?;
+
+            // Remove evicted mempool transactions
+            mempool
+                .write()
+                .unwrap()
+                .remove(indexed_txids.difference(&all_txids).collect());
+
+            indexed_txids.retain(|txid| all_txids.contains(txid));
+            fetched_txs.retain(|txid, _| all_txids.contains(txid));
+
+            // Fetch missing transactions from bitcoind
+            let new_txids = all_txids
+                .iter()
+                .filter(|&txid| !fetched_txs.contains_key(txid) && !indexed_txids.contains(txid))
+                .collect::<Vec<_>>();
+            if new_txids.is_empty() {
+                break;
+            }
+            debug!(
+                "mempool with total {} txs, {} fetched, {} missing",
+                all_txids.len(),
+                indexed_txids.len() + fetched_txs.len(),
+                new_txids.len()
+            );
+
+            {
+                let mempool = mempool.read().unwrap();
+
+                mempool
+                    .count
+                    .with_label_values(&["all_txs"])
+                    .set(all_txids.len() as f64);
+                mempool
+                    .count
+                    .with_label_values(&["fetched_txs"])
+                    .set((indexed_txids.len() + fetched_txs.len()) as f64);
+                mempool
+                    .count
+                    .with_label_values(&["missing_txs"])
+                    .set(new_txids.len() as f64);
+            }
+
+            let new_txs = daemon.gettransactions_available(&new_txids)?;
+
+            // Abort if the chain tip moved while fetching transactions
+            if daemon.getbestblockhash()? != *tip {
+                warn!("chain tip moved while updating mempool");
+                return Ok(false);
+            }
+
+            let fetched_count = new_txs.len();
+            fetched_txs.extend(new_txs);
+
+            // Retry if any transactions were evicted form the mempool before we managed to get them
+            if fetched_count != new_txids.len() {
+                warn!(
+                    "failed to fetch {} mempool txs, retrying...",
+                    new_txids.len() - fetched_count
+                );
+            } else {
+                break;
+            }
+        }
+
+        // Add fetched transactions to our view of the mempool
+        {
+            let mut mempool = mempool.write().unwrap();
+
+            mempool.add(fetched_txs)?;
+
+            mempool
+                .count
+                .with_label_values(&["txs"])
+                .set(mempool.txstore.len() as f64);
+
+            // Update cached backlog stats (if expired)
+            if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
+                mempool.update_backlog_stats();
+            }
+        }
+
+        trace!("mempool is synced");
+
+        Ok(true)
+    }
 }
 
 #[derive(Serialize)]
 pub struct BacklogStats {
     pub count: u32,
-    pub vsize: u32,     // in virtual bytes (= weight/4)
+    pub vsize: u64,     // in virtual bytes (= weight/4)
     pub total_fee: u64, // in satoshis
-    pub fee_histogram: Vec<(f32, u32)>,
+    pub fee_histogram: Vec<(f64, u64)>,
 }
 
 impl BacklogStats {
@@ -533,6 +636,7 @@ impl BacklogStats {
         }
     }
 
+    #[trace]
     fn new(feeinfo: &HashMap<Txid, TxFeeInfo>) -> Self {
         let (count, vsize, total_fee) = feeinfo
             .values()

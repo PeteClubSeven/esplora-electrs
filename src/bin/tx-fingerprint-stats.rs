@@ -9,7 +9,7 @@ fn main() {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use bitcoin::blockdata::script::Script;
+    use bitcoin::blockdata::script::ScriptBuf;
     use bitcoin::consensus::encode::deserialize;
     use electrs::{
         chain::Transaction,
@@ -21,9 +21,10 @@ fn main() {
         util::has_prevout,
     };
 
-    let signal = Waiter::start();
+    let signal = Waiter::start(crossbeam_channel::never());
     let config = Config::from_args();
-    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+    let metrics = Metrics::new(config.monitoring_addr);
+    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config, &metrics));
 
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();
@@ -33,6 +34,7 @@ fn main() {
             &config.daemon_dir,
             &config.blocks_dir,
             config.daemon_rpc_addr,
+            config.daemon_parallelism,
             config.cookie_getter(),
             config.network_type,
             config.signet_magic,
@@ -62,7 +64,7 @@ fn main() {
         }
 
         let tx: Transaction = deserialize(&value).expect("failed to parse Transaction");
-        let txid = tx.txid();
+        let txid = tx.compute_txid();
 
         iter.next();
 
@@ -71,7 +73,7 @@ fn main() {
             continue;
         }
         // skip coinbase txs
-        if tx.is_coin_base() {
+        if tx.is_coinbase() {
             continue;
         }
 
@@ -83,20 +85,36 @@ fn main() {
 
         //info!("{:?},{:?}", txid, blockid);
 
-        let prevouts = chain.lookup_txos(
-            &tx.input
-                .iter()
-                .filter(|txin| has_prevout(txin))
-                .map(|txin| txin.previous_output)
-                .collect(),
-        );
+        let prevouts = chain
+            .lookup_txos(
+                tx.input
+                    .iter()
+                    .filter(|txin| has_prevout(txin))
+                    .map(|txin| txin.previous_output)
+                    .collect(),
+            )
+            .unwrap();
 
-        let total_out: u64 = tx.output.iter().map(|out| out.value).sum();
-        let small_out = tx.output.iter().map(|out| out.value).min().unwrap();
-        let large_out = tx.output.iter().map(|out| out.value).max().unwrap();
+        let total_out: u64 = tx.output.iter().map(|out| out.value.to_sat()).sum();
+        let small_out = tx
+            .output
+            .iter()
+            .map(|out| out.value.to_sat())
+            .min()
+            .unwrap();
+        let large_out = tx
+            .output
+            .iter()
+            .map(|out| out.value.to_sat())
+            .max()
+            .unwrap();
 
-        let total_in: u64 = prevouts.values().map(|out| out.value).sum();
-        let smallest_in = prevouts.values().map(|out| out.value).min().unwrap();
+        let total_in: u64 = prevouts.values().map(|out| out.value.to_sat()).sum();
+        let smallest_in = prevouts
+            .values()
+            .map(|out| out.value.to_sat())
+            .min()
+            .unwrap();
 
         let fee = total_in - total_out;
 
@@ -119,7 +137,7 @@ fn main() {
 
         // test for sending back to one of the spent spks
         let has_reuse = {
-            let prev_spks: HashSet<Script> = prevouts
+            let prev_spks: HashSet<ScriptBuf> = prevouts
                 .values()
                 .map(|out| out.script_pubkey.clone())
                 .collect();

@@ -1,5 +1,7 @@
 use rayon::prelude::*;
 
+#[cfg(feature = "liquid")]
+use crate::elements::ebcompact::*;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::{deserialize, Decodable};
 #[cfg(feature = "liquid")]
@@ -12,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::thread;
 
+use electrs_macros::trace;
+
 use crate::chain::{Block, BlockHash};
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -23,6 +27,7 @@ pub enum FetchFrom {
     BlkFiles,
 }
 
+#[trace]
 pub fn start_fetcher(
     from: FetchFrom,
     daemon: &Daemon,
@@ -35,6 +40,7 @@ pub fn start_fetcher(
     fetcher(daemon, new_headers)
 }
 
+#[derive(Clone)]
 pub struct BlockEntry {
     pub block: Block,
     pub entry: HeaderEntry,
@@ -64,6 +70,7 @@ impl<T> Fetcher<T> {
     }
 }
 
+#[trace]
 fn bitcoind_fetcher(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
@@ -88,7 +95,7 @@ fn bitcoind_fetcher(
                     .zip(entries)
                     .map(|(block, entry)| BlockEntry {
                         entry: entry.clone(), // TODO: remove this clone()
-                        size: block.size() as u32,
+                        size: block.total_size() as u32,
                         block,
                     })
                     .collect();
@@ -96,17 +103,20 @@ fn bitcoind_fetcher(
                 sender
                     .send(block_entries)
                     .expect("failed to send fetched blocks");
+                log::debug!("last fetch {:?}", entries.last());
             }
         }),
     ))
 }
 
+#[trace]
 fn blkfiles_fetcher(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
     let magic = daemon.magic();
     let blk_files = daemon.list_blk_files()?;
+    let xor_key = daemon.read_blk_file_xor_key()?;
 
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
@@ -114,7 +124,7 @@ fn blkfiles_fetcher(
     let mut entry_map: HashMap<BlockHash, HeaderEntry> =
         new_headers.into_iter().map(|h| (*h.hash(), h)).collect();
 
-    let parser = blkfiles_parser(blkfiles_reader(blk_files), magic);
+    let parser = blkfiles_parser(blkfiles_reader(blk_files, xor_key), magic);
     Ok(Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_fetcher", move || {
@@ -147,7 +157,8 @@ fn blkfiles_fetcher(
     ))
 }
 
-fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
+#[trace]
+fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher<Vec<u8>> {
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
 
@@ -156,8 +167,11 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
         spawn_thread("blkfiles_reader", move || {
             for path in blk_files {
                 trace!("reading {:?}", path);
-                let blob = fs::read(&path)
+                let mut blob = fs::read(&path)
                     .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e));
+                if let Some(xor_key) = xor_key {
+                    blkfile_apply_xor_key(xor_key, &mut blob);
+                }
                 sender
                     .send(blob)
                     .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
@@ -166,6 +180,15 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
     )
 }
 
+/// By default, bitcoind v28.0+ applies an 8-byte "xor key" over each "blk*.dat"
+/// file. We have xor again to undo this transformation.
+fn blkfile_apply_xor_key(xor_key: [u8; 8], blob: &mut [u8]) {
+    for (i, blob_i) in blob.iter_mut().enumerate() {
+        *blob_i ^= xor_key[i & 0x7];
+    }
+}
+
+#[trace]
 fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBlock>> {
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
@@ -184,6 +207,7 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
     )
 }
 
+#[trace]
 fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
     let mut cursor = Cursor::new(&blob);
     let mut slices = vec![];

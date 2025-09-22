@@ -1,7 +1,8 @@
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
+use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
-use bitcoin::util::merkleblock::MerkleBlock;
-use bitcoin::VarInt;
+use bitcoin::merkle_tree::MerkleBlock;
+
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use itertools::Itertools;
@@ -11,6 +12,7 @@ use rayon::prelude::*;
 use bitcoin::consensus::encode::{deserialize, serialize};
 #[cfg(feature = "liquid")]
 use elements::{
+    confidential,
     encode::{deserialize, serialize},
     AssetId,
 };
@@ -19,23 +21,29 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::chain::{
+use crate::{chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
-};
+}, new_index::db_metrics::RocksDbMetrics};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
 use crate::util::{
-    full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta, BlockStatus, Bytes,
-    HeaderEntry, HeaderList, ScriptToAddr,
+    bincode, full_hash, has_prevout, is_spendable, BlockHeaderMeta, BlockId, BlockMeta,
+    BlockStatus, Bytes, HeaderEntry, HeaderList, ScriptToAddr,
 };
 
 use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB};
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
-use crate::elements::{asset, peg};
+use crate::elements::{asset, ebcompact::TxidCompat, peg};
+
+#[cfg(feature = "liquid")]
+use elements::encode::VarInt;
+
+#[cfg(not(feature = "liquid"))]
+use bitcoin::VarInt;
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
 
@@ -50,7 +58,7 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path, config: &Config) -> Self {
+    pub fn open(path: &Path, config: &Config, metrics: &Metrics) -> Self {
         let txstore_db = DB::open(&path.join("txstore"), config);
         let added_blockhashes = load_blockhashes(&txstore_db, &BlockRow::done_filter());
         debug!("{} blocks were added", added_blockhashes.len());
@@ -60,6 +68,11 @@ impl Store {
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
         let cache_db = DB::open(&path.join("cache"), config);
+
+        let db_metrics = Arc::new(RocksDbMetrics::new(&metrics));
+        txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
+        history_db.start_stats_exporter(Arc::clone(&db_metrics), "history_db");
+        cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
@@ -111,9 +124,9 @@ pub struct Utxo {
     pub value: Value,
 
     #[cfg(feature = "liquid")]
-    pub asset: elements::confidential::Asset,
+    pub asset: confidential::Asset,
     #[cfg(feature = "liquid")]
-    pub nonce: elements::confidential::Nonce,
+    pub nonce: confidential::Nonce,
     #[cfg(feature = "liquid")]
     pub witness: elements::TxOutWitness,
 }
@@ -325,7 +338,7 @@ impl Indexer {
     fn index(&self, blocks: &[BlockEntry]) {
         let previous_txos_map = {
             let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, &get_previous_txos(blocks), false)
+            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
         };
         let rows = {
             let _timer = self.start_timer("index_process");
@@ -340,6 +353,10 @@ impl Indexer {
             index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
         self.store.history_db.write(rows, self.flush);
+    }
+
+    pub fn fetch_from(&mut self, from: FetchFrom) {
+        self.from = from;
     }
 }
 
@@ -371,7 +388,6 @@ impl ChainQuery {
 
     pub fn get_block_txids(&self, hash: &BlockHash) -> Option<Vec<Txid>> {
         let _timer = self.start_timer("get_block_txids");
-
         if self.light_mode {
             // TODO fetch block as binary from REST API instead of as hex
             let mut blockinfo = self.daemon.getblock_raw(hash, 1).ok()?;
@@ -380,7 +396,7 @@ impl ChainQuery {
             self.store
                 .txstore_db
                 .get(&BlockRow::txids_key(full_hash(&hash[..])))
-                .map(|val| bincode::deserialize(&val).expect("failed to parse block txids"))
+                .map(|val| bincode::deserialize_little(&val).expect("failed to parse block txids"))
         }
     }
 
@@ -394,7 +410,7 @@ impl ChainQuery {
             self.store
                 .txstore_db
                 .get(&BlockRow::meta_key(full_hash(&hash[..])))
-                .map(|val| bincode::deserialize(&val).expect("failed to parse BlockMeta"))
+                .map(|val| bincode::deserialize_little(&val).expect("failed to parse BlockMeta"))
         }
     }
 
@@ -402,8 +418,9 @@ impl ChainQuery {
         let _timer = self.start_timer("get_block_raw");
 
         if self.light_mode {
-            let blockhex = self.daemon.getblock_raw(hash, 0).ok()?;
-            Some(hex::decode(blockhex.as_str().unwrap()).unwrap())
+            let blockval = self.daemon.getblock_raw(hash, 0).ok()?;
+            let blockhex = blockval.as_str().expect("valid block from bitcoind");
+            Some(Vec::from_hex(blockhex).expect("valid block from bitcoind"))
         } else {
             let entry = self.header_by_hash(hash)?;
             let meta = self.get_block_meta(hash)?;
@@ -451,6 +468,7 @@ impl ChainQuery {
             &TxHistoryRow::prefix_height(code, &hash[..], start_height as u32),
         )
     }
+
     fn history_iter_scan_reverse(&self, code: u8, hash: &[u8]) -> ReverseScanIterator {
         self.store.history_db.iter_scan_reverse(
             &TxHistoryRow::filter(code, &hash[..]),
@@ -527,7 +545,7 @@ impl ChainQuery {
             .store
             .cache_db
             .get(&UtxoCacheRow::key(scripthash))
-            .map(|c| bincode::deserialize(&c).unwrap())
+            .map(|c| bincode::deserialize_little(&c).unwrap())
             .and_then(|(utxos_cache, blockhash)| {
                 self.height_by_hash(&blockhash)
                     .map(|height| (utxos_cache, height))
@@ -632,7 +650,7 @@ impl ChainQuery {
             .store
             .cache_db
             .get(&StatsCacheRow::key(scripthash))
-            .map(|c| bincode::deserialize(&c).unwrap())
+            .map(|c| bincode::deserialize_little(&c).unwrap())
             .and_then(|(stats, blockhash)| {
                 self.height_by_hash(&blockhash)
                     .map(|height| (stats, height))
@@ -669,6 +687,9 @@ impl ChainQuery {
             .map(TxHistoryRow::from_row)
             .filter_map(|history| {
                 self.tx_confirming_block(&history.get_txid())
+                    // drop history entries that were previously confirmed in a re-orged block and later
+                    // confirmed again at a different height
+                    .filter(|blockid| blockid.height == history.key.confirmed_height as usize)
                     .map(|blockid| (history, blockid))
             });
 
@@ -820,7 +841,7 @@ impl ChainQuery {
         let _timer = self.start_timer("lookup_txn");
         self.lookup_raw_txn(txid, blockhash).map(|rawtx| {
             let txn: Transaction = deserialize(&rawtx).expect("failed to parse Transaction");
-            assert_eq!(*txid, txn.txid());
+            assert_eq!(*txid, txn.compute_txid());
             txn
         })
     }
@@ -833,11 +854,12 @@ impl ChainQuery {
                 blockhash.map_or_else(|| self.tx_confirming_block(txid).map(|b| b.hash), |_| None);
             let blockhash = blockhash.or_else(|| queried_blockhash.as_ref())?;
             // TODO fetch transaction as binary from REST API instead of as hex
-            let txhex = self
+            let txval = self
                 .daemon
                 .gettransaction_raw(txid, blockhash, false)
                 .ok()?;
-            Some(hex::decode(txhex.as_str().unwrap()).unwrap())
+            let txhex = txval.as_str().expect("valid tx from bitcoind");
+            Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
         } else {
             self.store.txstore_db.get(&TxRow::key(&txid[..]))
         }
@@ -848,14 +870,9 @@ impl ChainQuery {
         lookup_txo(&self.store.txstore_db, outpoint)
     }
 
-    pub fn lookup_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
+    pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
         let _timer = self.start_timer("lookup_txos");
-        lookup_txos(&self.store.txstore_db, outpoints, false)
-    }
-
-    pub fn lookup_avail_txos(&self, outpoints: &BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
-        let _timer = self.start_timer("lookup_available_txos");
-        lookup_txos(&self.store.txstore_db, outpoints, true)
+        lookup_txos(&self.store.txstore_db, outpoints)
     }
 
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
@@ -873,6 +890,7 @@ impl ChainQuery {
                 })
             })
     }
+
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
         let headers = self.store.indexed_headers.read().unwrap();
@@ -971,9 +989,9 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .map(|b| {
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
-            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.txid()).collect();
-            for tx in &b.block.txdata {
-                add_transaction(tx, blockhash, &mut rows, iconfig);
+            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+            for (tx, txid) in b.block.txdata.iter().zip(txids.iter()) {
+                add_transaction(*txid, tx, blockhash, &mut rows, iconfig);
             }
 
             if !iconfig.light_mode {
@@ -990,18 +1008,19 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
 }
 
 fn add_transaction(
+    txid: Txid,
     tx: &Transaction,
     blockhash: FullHash,
     rows: &mut Vec<DBRow>,
     iconfig: &IndexerConfig,
 ) {
-    rows.push(TxConfRow::new(tx, blockhash).into_row());
+    rows.push(TxConfRow::new(txid, blockhash).into_row());
 
     if !iconfig.light_mode {
-        rows.push(TxRow::new(tx).into_row());
+        rows.push(TxRow::new(txid, tx).into_row());
     }
 
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&txid[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) {
             rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
@@ -1022,31 +1041,19 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
         .collect()
 }
 
-fn lookup_txos(
-    txstore_db: &DB,
-    outpoints: &BTreeSet<OutPoint>,
-    allow_missing: bool,
-) -> HashMap<OutPoint, TxOut> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(16) // we need to saturate SSD IOPS
-        .thread_name(|i| format!("lookup-txo-{}", i))
-        .build()
-        .unwrap();
-    pool.install(|| {
-        outpoints
-            .par_iter()
-            .filter_map(|outpoint| {
-                lookup_txo(&txstore_db, &outpoint)
-                    .or_else(|| {
-                        if !allow_missing {
-                            panic!("missing txo {} in {:?}", outpoint, txstore_db);
-                        }
-                        None
-                    })
-                    .map(|txo| (*outpoint, txo))
-            })
-            .collect()
-    })
+fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+    let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
+    txstore_db
+        .multi_get(keys)
+        .into_iter()
+        .zip(outpoints)
+        .map(|(res, outpoint)| {
+            let txo = res
+                .unwrap()
+                .ok_or_else(|| format!("missing txo {}", outpoint))?;
+            Ok((outpoint, deserialize(&txo).expect("failed to parse TxOut")))
+        })
+        .collect()
 }
 
 fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
@@ -1088,7 +1095,7 @@ fn index_transaction(
     //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
     // persist "edges" for fast is-this-TXO-spent check
     //      S{funding-txid:vout}{spending-txid:vin} → ""
-    let txid = full_hash(&tx.txid()[..]);
+    let txid = full_hash(&tx.compute_txid()[..]);
     for (txo_index, txo) in tx.output.iter().enumerate() {
         if is_spendable(txo) || iconfig.index_unspendables {
             let history = TxHistoryRow::new(
@@ -1097,7 +1104,7 @@ fn index_transaction(
                 TxHistoryInfo::Funding(FundingInfo {
                     txid,
                     vout: txo_index as u16,
-                    value: txo.value,
+                    value: txo.value.amount_value(),
                 }),
             );
             rows.push(history.into_row());
@@ -1125,7 +1132,7 @@ fn index_transaction(
                 vin: txi_index as u16,
                 prev_txid: full_hash(&txi.previous_output.txid[..]),
                 prev_vout: txi.previous_output.vout as u16,
-                value: prev_txo.value,
+                value: prev_txo.value.amount_value(),
             }),
         );
         rows.push(history.into_row());
@@ -1188,8 +1195,8 @@ struct TxRow {
 }
 
 impl TxRow {
-    fn new(txn: &Transaction) -> TxRow {
-        let txid = full_hash(&txn.txid()[..]);
+    fn new(txid: Txid, txn: &Transaction) -> TxRow {
+        let txid = full_hash(&txid[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),
@@ -1203,7 +1210,7 @@ impl TxRow {
     fn into_row(self) -> DBRow {
         let TxRow { key, value } = self;
         DBRow {
-            key: bincode::serialize(&key).unwrap(),
+            key: bincode::serialize_little(&key).unwrap(),
             value,
         }
     }
@@ -1221,8 +1228,8 @@ struct TxConfRow {
 }
 
 impl TxConfRow {
-    fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txn.txid()[..]);
+    fn new(txid: Txid, blockhash: FullHash) -> TxConfRow {
+        let txid = full_hash(&txid[..]);
         TxConfRow {
             key: TxConfKey {
                 code: b'C',
@@ -1238,14 +1245,14 @@ impl TxConfRow {
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: vec![],
         }
     }
 
     fn from_row(row: DBRow) -> Self {
         TxConfRow {
-            key: bincode::deserialize(&row.key).expect("failed to parse TxConfKey"),
+            key: bincode::deserialize_little(&row.key).expect("failed to parse TxConfKey"),
         }
     }
 }
@@ -1274,7 +1281,7 @@ impl TxOutRow {
         }
     }
     fn key(outpoint: &OutPoint) -> Bytes {
-        bincode::serialize(&TxOutKey {
+        bincode::serialize_little(&TxOutKey {
             code: b'O',
             txid: full_hash(&outpoint.txid[..]),
             vout: outpoint.vout as u16,
@@ -1284,7 +1291,7 @@ impl TxOutRow {
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
         }
     }
@@ -1315,14 +1322,14 @@ impl BlockRow {
     fn new_txids(hash: FullHash, txids: &[Txid]) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'X', hash },
-            value: bincode::serialize(txids).unwrap(),
+            value: bincode::serialize_little(txids).unwrap(),
         }
     }
 
     fn new_meta(hash: FullHash, meta: &BlockMeta) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'M', hash },
-            value: bincode::serialize(meta).unwrap(),
+            value: bincode::serialize_little(meta).unwrap(),
         }
     }
 
@@ -1351,14 +1358,14 @@ impl BlockRow {
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
         }
     }
 
     fn from_row(row: DBRow) -> Self {
         BlockRow {
-            key: bincode::deserialize(&row.key).unwrap(),
+            key: bincode::deserialize_little(&row.key).unwrap(),
             value: row.value,
         }
     }
@@ -1439,28 +1446,22 @@ impl TxHistoryRow {
     }
 
     fn prefix_end(code: u8, hash: &[u8]) -> Bytes {
-        bincode::serialize(&(code, full_hash(&hash[..]), std::u32::MAX)).unwrap()
+        bincode::serialize_big(&(code, full_hash(&hash[..]), std::u32::MAX)).unwrap()
     }
 
     fn prefix_height(code: u8, hash: &[u8], height: u32) -> Bytes {
-        bincode::config()
-            .big_endian()
-            .serialize(&(code, full_hash(&hash[..]), height))
-            .unwrap()
+        bincode::serialize_big(&(code, full_hash(&hash[..]), height)).unwrap()
     }
 
     pub fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::config().big_endian().serialize(&self.key).unwrap(),
+            key: bincode::serialize_big(&self.key).unwrap(),
             value: vec![],
         }
     }
 
     pub fn from_row(row: DBRow) -> Self {
-        let key = bincode::config()
-            .big_endian()
-            .deserialize(&row.key)
-            .expect("failed to deserialize TxHistoryKey");
+        let key = bincode::deserialize_big(&row.key).expect("failed to deserialize TxHistoryKey");
         TxHistoryRow { key }
     }
 
@@ -1526,19 +1527,20 @@ impl TxEdgeRow {
 
     fn filter(outpoint: &OutPoint) -> Bytes {
         // TODO build key without using bincode? [ b"S", &outpoint.txid[..], outpoint.vout?? ].concat()
-        bincode::serialize(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16)).unwrap()
+        bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
+            .unwrap()
     }
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: vec![],
         }
     }
 
     fn from_row(row: DBRow) -> Self {
         TxEdgeRow {
-            key: bincode::deserialize(&row.key).expect("failed to deserialize TxEdgeKey"),
+            key: bincode::deserialize_little(&row.key).expect("failed to deserialize TxEdgeKey"),
         }
     }
 }
@@ -1561,7 +1563,7 @@ impl StatsCacheRow {
                 code: b'A',
                 scripthash: full_hash(scripthash),
             },
-            value: bincode::serialize(&(stats, blockhash)).unwrap(),
+            value: bincode::serialize_little(&(stats, blockhash)).unwrap(),
         }
     }
 
@@ -1571,7 +1573,7 @@ impl StatsCacheRow {
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
         }
     }
@@ -1593,7 +1595,7 @@ impl UtxoCacheRow {
                 code: b'U',
                 scripthash: full_hash(scripthash),
             },
-            value: bincode::serialize(&(utxos_cache, blockhash)).unwrap(),
+            value: bincode::serialize_little(&(utxos_cache, blockhash)).unwrap(),
         }
     }
 
@@ -1603,7 +1605,7 @@ impl UtxoCacheRow {
 
     fn into_row(self) -> DBRow {
         DBRow {
-            key: bincode::serialize(&self.key).unwrap(),
+            key: bincode::serialize_little(&self.key).unwrap(),
             value: self.value,
         }
     }
@@ -1634,4 +1636,69 @@ fn from_utxo_cache(utxos_cache: CachedUtxoMap, chain: &ChainQuery) -> UtxoMap {
             (outpoint, (blockid, value))
         })
         .collect()
+}
+
+// Get the amount value as gets stored in the DB and mempool tracker.
+// For bitcoin it is the Amount's inner u64, for elements it is the confidential::Value itself.
+pub trait GetAmountVal {
+    #[cfg(not(feature = "liquid"))]
+    fn amount_value(self) -> u64;
+    #[cfg(feature = "liquid")]
+    fn amount_value(self) -> confidential::Value;
+}
+
+#[cfg(not(feature = "liquid"))]
+impl GetAmountVal for bitcoin::Amount {
+    fn amount_value(self) -> u64 {
+        self.to_sat()
+    }
+}
+#[cfg(feature = "liquid")]
+impl GetAmountVal for confidential::Value {
+    fn amount_value(self) -> confidential::Value {
+        self
+    }
+}
+
+// This is needed to bench private functions
+#[cfg(feature = "bench")]
+pub mod bench {
+    use crate::new_index::schema::IndexerConfig;
+    use crate::new_index::BlockEntry;
+    use crate::new_index::DBRow;
+    use crate::util::HeaderEntry;
+    use bitcoin::Block;
+
+    pub struct Data {
+        block_entry: BlockEntry,
+        iconfig: IndexerConfig,
+    }
+
+    impl Data {
+        pub fn new(block: Block) -> Data {
+            let iconfig = IndexerConfig {
+                light_mode: false,
+                address_search: false,
+                index_unspendables: false,
+                network: crate::chain::Network::Regtest,
+            };
+            let height = 702861;
+            let hash = block.block_hash();
+            let header = block.header.clone();
+            let block_entry = BlockEntry {
+                block,
+                entry: HeaderEntry::new(height, hash, header),
+                size: 0u32, // wrong but not needed for benching
+            };
+
+            Data {
+                block_entry,
+                iconfig,
+            }
+        }
+    }
+
+    pub fn add_blocks(data: &Data) -> Vec<DBRow> {
+        super::add_blocks(&[data.block_entry.clone()], &data.iconfig)
+    }
 }
